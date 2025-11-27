@@ -1,0 +1,289 @@
+---
+title: "lme vs tweedie model"
+author: "Sara Westman" 
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+&NewLine;
+</br>
+
+# Set-up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load packages 
+```{r}
+suppressMessages(library(tidyverse))
+suppressMessages(library(DHARMa))
+suppressMessages(library(pryr))
+suppressMessages(library(lme4))
+suppressMessages(library(dplyr))
+suppressMessages(library(glmmTMB))
+suppressMessages(library(purrr))
+suppressMessages(library(cplm))
+suppressMessages(library(kableExtra))
+```
+
+## Load data 
+```{r}
+out_dir <- "/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/Metabolite_data/BLUPs/SPGs_tweedie/Model_evaluation"
+dat <- read.delim("/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/Metabolite_data/raw_data/s12.SPGs.final.Dec2019_noNA_meta_data.txt")
+BLUP_shap <- read.delim("/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/Metabolite_data/BLUPs/SPGs/stats/SPGs_leaves_BLUP_shapiro.txt")
+all_traits <- colnames(dat)[10:ncol(dat)]
+
+random_effect <- "Clone"
+fixed_effect <- "Meta.block"
+```
+
+## Prep data 
+```{r}
+dat <- dplyr::mutate(dat, dplyr::across(dplyr::all_of(random_effect), as.factor))
+dat <- dplyr::mutate(dat, dplyr::across(dplyr::all_of(fixed_effect), as.factor))
+
+for(i in fixed_effect) {
+  if(is.factor(dat[[i]])) {
+    contrasts(dat[[i]]) <- contr.sum(dat[[i]] %>% levels() %>% length())
+  } else {    
+    stop("Contrasts require fixed effects as factor type")
+  }
+}
+
+# Normalize data - in this case, all traits were transformed in the BLUP pipeline 
+dat_norm <- dplyr::mutate(dat, dplyr::across(all_of(all_traits), ~ {
+  output <- purrr::quietly(bestNormalize::orderNorm)(.)
+  if (length(output$warnings) > 0) {
+    message(paste0("\tWarning: ", dplyr::cur_column(), ": ", output$warnings), appendLF = FALSE)
+  }
+  output$result$x.t
+}))
+```
+
+## First, select potential models based on the nature of your data
+It depends on the nature of your dependent variable (Y):
+- Gaussian: is for continuous DV (this is ordinary least squares)
+- Binomial: is for logistic regression.
+- Poisson: is for count data (non-negative integers). See also quasipoisson.
+- Gamma: is for continuous DV that is always positive (although often you can use Gaussian here, if the mean is >>0 and the sd isn't huge - that is, if all the values are quite far from 0).
+- Inverse Gaussian: is, I believe, used for survival data (time to event).
+
+More specifically, we should think of the distribution as a description of the process that generates the data.
+Counts are integers, whereas the normal distribution is for continuous data that can include any fraction.
+Counts also can’t be less than zero, but the Normal distribution model’s stochastic processes that draw zeros and negative numbers.
+
+For instance, you can use "identity" link for data that is far from zero. If you use the identity link, which is basically no link function, your model will be linear, not log-linear, so your slope estimate will once again be additive.
+
+Technically we would say we fitted a Generalized Linear Model with Poisson errors and a log link function. We talk about Poisson errors (not Poisson data), because it is the left over variation after we fit the model (AKA the errors or residuals) that we are assuming is Poisson distributed.
+
+The model actually doesn’t make any assumptions about how the raw data are distributed, so long as they are integers and non-negative. Note that the data can contain zeros, but the mean of the Poisson is always >0.
+
+We also have the tweedie family:
+A second approach is the use of a positive distribution that simultaneously incorporates zeros and positive quantities. Jorgensen (1987) proposed the exponential dispersion model, with a power variance function. This model, also known as the Tweedie distribution, handles zero-inﬂated data without treating the zero and nonzero values separately. (https://besjournals.onlinelibrary.wiley.com/doi/epdf/10.1111/2041-210X.12122)
+
+Some familiar distributions are special cases of the Tweedie distribution:
+- p = 0 : Normal distribution 
+- p = 1: Poisson distribution
+- 1 < p < 2: Compound Poisson distribution 
+- p = 2 gamma distribution 
+- 2 < p < 3 Positive stable distributions,
+- p = 3: Inverse Gaussian distribution / Wald distribution
+- p > 3: Positive stable distributions,
+- p = ∞ Extreme stable distributions.
+https://www.statisticshowto.com/tweedie-distribution/
+https://stats.stackexchange.com/questions/38282/how-do-i-decide-which-family-of-variance-link-functions-to-use-in-a-generalized 
+https://www.rdocumentation.org/packages/statmod/versions/1.4.35/topics/tweedie - good desciption of tweedie families 
+
+## Check for zeros
+```{r}
+# Check BLUP pipeline normally distributed traits 
+isNorm_df <- BLUP_shap %>% dplyr:: select("Trait", dplyr::starts_with("ranef_isNorm"), dplyr::starts_with("resid_isNorm")) %>% as.data.frame() %>% tibble::column_to_rownames(var = "Trait")
+(traits_Norm <- apply(isNorm_df, 1, function(x) sum(x == TRUE) / length(x)) %>% as.data.frame() %>% subset(. == 1) %>% rownames())
+(traits_notNorm <- BLUP_shap$Trait[!(BLUP_shap$Trait %in% traits_Norm)])
+
+# Zero data frame
+zero_df <- purrr::map_df(all_traits, function(t) {
+  tibble(Trait = t,
+         Proportion_zero = mean(!dat[[t]]))
+  })
+
+zero_df_sort <- zero_df[order(zero_df$Proportion_zero),]
+traits_zeroOrder <- zero_df_sort %>% subset(Trait %in% traits_notNorm) %>% pull(Trait)
+```
+
+## Fit models
+```{r, warning = FALSE}
+# except Benzoyl.tremuloidin_6 - crashes the R-session when simulated in DHARMa
+traits_notNorm <- traits_notNorm[c(1:37, 39:42)]
+stopifnot(!"Benzoyl.tremuloidin_6" %in% traits_notNorm)
+
+# lmer 
+lmms_all <- purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) {
+  fittedModel <- lme4::lmer(dat_norm[[t]] ~ Meta.block + (1 | Clone), data = dat_norm, REML = TRUE)
+  })
+
+# glmmTMB 
+glmm_tweedie <- purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) {
+  fittedModel <- glmmTMB::glmmTMB(dat[[t]] ~ Meta.block + (1 | Clone), family = glmmTMB::tweedie(link = "log"), data = dat)
+  })
+
+# Compare glmmTMB with cplm package 
+cpglmm_all <- purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) {
+  dat$trait <- dat[[t]]
+  fittedModel <- cpglmm(trait ~ Meta.block + (1 | Clone), data = dat)
+}) 
+
+purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) {
+  cor(ranef(glmm_tweedie[[t]])[[1]]$Clone[,1], ranef(cpglmm_all[[t]])[[1]][,1])
+}) 
+```
+
+## DHARMa simulations
+```{r, warning = FALSE}
+# lmer 
+lmms_sim <- purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) {
+  simulationOutput <- simulateResiduals(fittedModel = lmms_all[[t]], plot = FALSE)
+  })
+
+# tweedie
+tweedie_sim <- purrr::map(setNames(traits_notNorm, traits_notNorm), function(t) { 
+  simulationOutput <- simulateResiduals(fittedModel = glmm_tweedie[[t]], plot = FALSE)
+  })
+```
+
+## Check if data is zero-inflated 
+simulated number of zeroes with your actual number shown as red (shown if plot = T).
+```{r, warning = FALSE}
+# lmer 
+norm_zeroinf <- map_df(traits_notNorm, function(t) {
+  simulationOutput <- simulateResiduals(fittedModel = lmms_all[[t]], plot = FALSE)
+  res <- testZeroInflation(simulationOutput)
+  tibble(Trait = t, 
+         ratioObsSim = res$statistic[[1]],
+         ZeroInf_pval = res$p.value)
+  })
+norm_zeroinf %>% kbl() %>% kable_paper() %>% scroll_box(width = "500px", height = "200px")
+
+# Tweedie
+tweedie_zeroinf <- map_df(traits_notNorm, function(t) { 
+  res <- testZeroInflation(tweedie_sim[[t]], plot = FALSE)
+  tibble(Trait = t, 
+         ZeroInf_pval = res$p.value,
+         ratioObsSim = res$statistic[[1]])
+  })
+tweedie_zeroinf %>% kbl() %>% kable_paper() %>% scroll_box(width = "500px", height = "200px")
+tweedie_zeroinf_traits <- tweedie_zeroinf %>% subset(ZeroInf_pval < 0.05) %>% pull(Trait)
+```
+
+* Zero-inflation tests after fitting the model are crucial to see if you have zero-inflation. Just because there are a lot of zeros doesn't mean you have zero-inflation, see Warton, D. I. (2005). Many zeros does not mean zero inflation: comparing the goodness-of-fit of parametric models to multivariate abundance data. Environmetrics 16(3), 275-289.
+
+* That being said, zero-inflation tests are often not a reliable guide to decide wheter to add a zi term or not. In general, model structures should be decided on ideally a priori, if that is not possible via model selection techniques (AIC, BIC, WAIC, Bayes Factor). A zero-inflation test should only be run after that decision, and to validate the decision that was taken.
+
+## Plot DHARMa
+
+### Quantile-quantile plot for a uniform distribution 
+```{r, warning = FALSE, results = "hide"}
+# Plot uniform
+pdf(file = file.path(out_dir, "Tweedie_vs_norm_lmer_QQuniform_plots.pdf"), width = 10, height = 6)
+map(traits_zeroOrder[-40], function(t) {
+  # Select trait 
+  my_lmms_sim <- lmms_sim[[t]]
+  my_tweedie_sim <- tweedie_sim[[t]]
+  
+  # Extract proportion of zero
+  zeroper <- zero_df[grepl(paste0(t, "$"), as.character(zero_df$Trait)), ] %>% pull(Proportion_zero)
+
+  # Make plots 
+  p.multi.plot %<a-% {
+    split.screen(c(1,2))
+    
+    screen(1)
+    plotQQunif(my_lmms_sim)
+    mtext(paste0("NORM: ", t," (", round(zeroper, 3)*100, "% zeros)"), side = 3)
+    
+    screen(2)
+    plotQQunif(my_tweedie_sim)
+    mtext(paste0("TWEEDIE: ", t," (", round(zeroper, 3)*100, "% zeros)"), side = 3)
+    
+    close.screen(all = TRUE)
+    }
+  p.multi.plot
+  })
+graphics.off()
+```
+
+### Residual plot
+```{r, warning = FALSE, results = "hide"}
+pdf(file = file.path(out_dir, "Tweedie_vs_norm_lmer_residuals_plot.pdf"), width = 10, height = 6)
+map(traits_zeroOrder[-40], function(t) {
+  # Select trait 
+  my_lmms_sim <- lmms_sim[[t]]
+  my_tweedie_sim <- tweedie_sim[[t]]
+  
+  # Extract proportion of zero
+  zeroper <- zero_df[grepl(paste0(t, "$"), as.character(zero_df$Trait)), ] %>% pull(Proportion_zero)
+  
+  # Make plots 
+  p.multi.plot %<a-% {
+    split.screen(c(1,2))
+
+    screen(1)
+    plotResiduals(my_lmms_sim)
+    mtext(paste0("NORM: ", t," (", round(zeroper, 3)*100, "% zeros)"), side = 1)
+    
+    screen(2)
+    plotResiduals(my_tweedie_sim)
+    mtext(paste0("TWEEDIE: ", t," (", round(zeroper, 3)*100, "% zeros)"), side = 1)
+  
+    close.screen(all=TRUE)
+    }
+  p.multi.plot
+  })
+graphics.off()
+```
+
+## Identify Tweedie traits by scanning the DHARMa plots 
+```{r}
+# Conclusion after scanning the images: 
+# lmer traits: traits with < 20% zeros
+# Tweedie traits: the rest of the notNorm traits  
+zero_df %>% subset(Trait %in% traits_Norm) # Norm traits are also below < 20 % zeros 
+
+# Make a df classifying Tweedie and norm traits
+zero_df$Best_fit_evaluation <- ifelse(zero_df$Proportion_zero < 0.20, "Norm", "Tweedie")
+
+# Extract names of traits
+tweedie_traits <- zero_df %>% subset(Best_fit_evaluation == "Tweedie") %>% pull(Trait) %>% as.data.frame() %>% data.table::setnames(".", "Trait")
+issue_tweedie <- c("Caffeoyl.salicin", "Benzoyl.tremuloidin_6") %>% as.data.frame() %>% data.table::setnames(".", "Trait") # Caffeoyl.salicin is also an issue trait when simulated 10000 times
+norm_traits <- zero_df %>% subset(Best_fit_evaluation == "Norm") %>% pull(Trait) %>% as.data.frame() %>% data.table::setnames(".", "Trait")
+
+# Extract colnumber
+tweedie_traits$tweedie_colnr <- match(tweedie_traits %>% pull(Trait), names(dat))
+issue_tweedie$issue_tweedie_colnr <- match(issue_tweedie %>% pull(Trait), names(dat))
+norm_traits$Norm_colnr <- match(norm_traits %>% pull(Trait), names(dat))
+
+# Save info 
+write_tsv(tweedie_traits %>% subset(!Trait %in% issue_tweedie$Trait), file = file.path(out_dir, "Tweedie_trait_column_nr.tsv"), col_names = TRUE)
+write_tsv(issue_tweedie, file = file.path(out_dir, "Issue_tweedie_trait_column_nr.tsv"), col_names = TRUE)
+write_tsv(norm_traits, file = file.path(out_dir, "Norm_trait_column_nr.tsv"), col_names = TRUE)
+```
+
+## General remarks on interperting residual patterns and tests
+In all plots / tests that were shown so far, the model was correctly specified, resulting in “perfect” residual plots. In this section, we discuss how to recognize and interpret model misspecifications in the scaled residuals. Note, however, that
+
+The fact that none of the here-presented tests shows a misspecification problem doesn’t proof that the model is correctly specified. There are likely a large number of structural problems that will not show a pattern in the standard residual plots.
+
+Conversely, while a clear pattern in the residuals indicates with good reliability that the observed data would not be likely to originate from the fitted model, it doesn’t necessarily indicate that the model results are not useable. There are many cases where it is common practice to work “wrong models”. For example, random effect estimates (in particular in GLMMs) are often slightly biased, especially if the model is fit with MLE. For that reason, DHARMa will often show a slight pattern in the residuals even if the model is correctly specified, and tests for this can get significant for large sample sizes. Another example is data that is missing at random (MAR) (see here). It is known that this phenomenon does not create a bias on the fixed effect estimates, and it is therefore common practice to fit this data with mixed models. Nevertheless, DHARMa recognizes that the observed data looks different than what would be expected from the model assumptions, and flags the model as problematic
+
+Important conclusion: DHARMa only flags a difference between the observed and expected data - the user has to decide whether this difference is actually a problem for the analysis!
+
+This leads us to another A word of warning that applies also to all tests: significance is NOT a measures of the strength of the residual pattern, it is a measure of the signa/noise ratio. Significance in hypothesis tests depends on at least 2 ingredients: strenght of the signal, and number of data points. Hence, the p-value alone is not a good indicator of the extent to which your residuals deviate from assumptions. Specifically, if you have a lot of data points, residual diagnostics will nearly inevitably become significant, because having a perfectly fitting model is very unlikely. That, however, doesn’t necessarily mean that you need to change your model. The p-values confirm that there is a deviation from your null hypothesis. It is, however, in your discretion to decide whether this deviation is worth worrying about. For example, if you see a dispersion parameter of 1.01, I would not worry, even if the dispersion test is significant. A significant value of 5, however, is clearly a reason to move to a model that accounts for overdispersion.
+
+# Save session info 
+```{r}
+writeLines(capture.output(sessionInfo()), paste("sessionInfo",Sys.Date() ,".txt", sep=""))
+sessionInfo()
+```

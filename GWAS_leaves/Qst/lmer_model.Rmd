@@ -1,0 +1,192 @@
+---
+title: "lmer model evaluation"
+author: "Sara Westman" 
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+&NewLine;
+</br>
+
+# Set-up
+
+## References 
+Hox, J. 2010. Multiplevel Analysis: Techniques and Applications.
+
+https://www.rensvandeschoot.com/tutorials/lme4/
+
+https://ademos.people.uic.edu/Chapter17.
+
+https://stats.stackexchange.com/questions/277009/why-are-the-degrees-of-freedom-for-multiple-regression-n-k-1-for-linear-reg
+
+## Load packages 
+```{r, message = FALSE}
+library(jtools)
+library(lmerTest)
+library(lme4)
+library(dplyr)
+library(tidyverse)
+library(sjstats)
+library(specr)
+```
+
+## Load data
+```{r}
+dat <- read.delim("/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/Pop_genetics/Qst/lmer/SPGs_buds_Outlier_removed_lmer_data.3.reps_pop_lat.txt")
+random_effect <- c("Genotype", "Pop.latitude")
+fixed_effects <- c("Meta.block")
+trait_names <- colnames(dat)[5:ncol(dat)]
+
+# Set models that should be compared
+model_basic <- paste0("(1 | ", random_effect, ")")
+model2 <- c(fixed_effects[1], model_basic)
+#model3 <- c(fixed_effects[2], model_basic)
+#model4 <- c(fixed_effects[1], fixed_effects[2], model_basic)
+
+model_basic
+model2
+#model3
+#model4
+```
+
+## Prep data 
+```{r}
+# Convert model effects to factor type 
+all_model_ef <- c(random_effect, fixed_effects) 
+dat <- dplyr::mutate(dat, across(all_of(all_model_ef), as.factor))
+
+# Convert fixed effects to deviation coding system 
+for(i in fixed_effects) {
+  if(is.factor(dat[[i]])) {
+    contrasts(dat[[i]]) <- contr.sum(dat[[i]] %>% levels() %>% length())
+    } else {
+      stop("Contrasts require fixed effects as factor type")
+    }
+  }
+```
+
+## Assess the model - how well does our included variable predict the response variable? 
+
+Multilevel regression models has become known in the litterature under a variety of names, e.g.: random coefficient model, variance component model, hierarchical linear model and mixed-effect or mixed model.  
+
+Model structure: 
+&NewLine;
+</br>
+1 = A global intercept 
+&NewLine;
+</br>
+(1 | X) = Random intercepts and slopes for genotypes (different baselines, different average effect per genotype). In more detail: Between brackets we have the random effects/slopes. Again the value 1 is to indicate the intercept and the variables right of the vertical “|” bar are used to indicate grouping variables. In this case the genotype. So the dependent variable ‘trait’ is predicted by an intercept and a random error term for the intercept.
+
+The Maximum Likelihood procedure also produces a statistic called the deviance, which indicates how well the model fits the data. In general, models with a lower deviance fit better than models with a higher deviance. 
+The intercept-only model is useful as a null-model that serves as a benchmark with which other models are compared.
+
+At this point the important thing to note is that the default estimation criterion is the REML criterion. Generally the REML estimates of variance components are preferred to the ML estimates. However, when comparing models it is safest to refit all the models using the maximum likelihood criterion.
+
+## Start simple
+```{r}
+# The intercept only model
+lmer_basic <- lapply(trait_names, function(t) {
+  lmer.calc <- lme4::lmer(formula = reformulate(termlabels = model_basic, response = t), data = dat, REML = FALSE)
+  })
+names(lmer_basic) <- trait_names
+```
+ 
+## Make it more complex 
+```{r}
+# Model 2
+lmer_model2 <- lapply(trait_names, function(t) {
+  lmer.calc <- lme4::lmer(formula = reformulate(termlabels = model2, response = t), data = dat, REML = FALSE)
+  })
+names(lmer_model2) <- trait_names
+
+# Model 3
+#lmer_model3 <- lapply(trait_names, function(t) {
+#  lmer.calc <- lme4::lmer(formula = reformulate(termlabels = model3, response = t), data = dat, REML = FALSE)
+#  })
+#names(lmer_model3) <- trait_names
+
+# Model 4
+#lmer_model4 <- lapply(trait_names, function(t) {
+#  lmer.calc <- lme4::lmer(formula = reformulate(termlabels = model4, response = t), data = dat, REML = FALSE)
+#  })
+#names(lmer_model4) <- trait_names
+```
+
+## Compare the models
+
+Test models with backwards elimination, i.e., this function compares the fit of the model to see how fit has improved with additional terms. Refer to the p-values in the output to see whether there was an improvement in fit (p < 0.05 = better fit)
+```{r}
+# Basic vs Model 2
+stats_basicM2 <- lapply(trait_names, function(t) {
+  res <- anova(lmer_basic[[t]], lmer_model2[[t]])
+  pval <- res$`Pr(>Chisq)`[2]
+  data.frame(trait = t,
+             p_val = pval)
+}) %>% bind_rows %>% tibble::as_tibble()
+message(paste0("\tNr of trait with improved fit: ", stats_basicM2 %>% filter(p_val < 0.05) %>% nrow()))
+
+# Basic vs Model 3
+stats_basicM3 <- lapply(trait_names, function(t) {
+  res <- anova(lmer_basic[[t]], lmer_model3[[t]])
+  pval <- res$`Pr(>Chisq)`[2]
+  data.frame(trait = t,
+             p_val = pval)
+}) %>% bind_rows %>% tibble::as_tibble()
+message(paste0("\tNr of trait with improved fit: ", stats_basicM3 %>% filter(p_val < 0.05) %>% nrow()))
+
+# Model3 vs Model 4
+stats_M3M4 <- lapply(trait_names, function(t) {
+  res <- anova(lmer_model3[[t]], lmer_model4[[t]])
+  pval <- res$`Pr(>Chisq)`[2]
+  data.frame(trait = t,
+             p_val = pval)
+}) %>% bind_rows %>% tibble::as_tibble()
+message(paste0("\tNr of trait with improved fit: ", stats_M3M4 %>% filter(p_val < 0.05) %>% nrow()))
+```
+Select the best model! 
+
+## Test your random effects
+Let's take a look at the ICC value (= indication of clustering in the data) of a trait. ICC - One of the reasons why mixed models are needed (see explanation Hox 2010 (p. 4)).
+```{r}
+summ(lmer_model2[[1]])
+```
+
+No significance test for the Random effects are given above, but we do see that the error term (Variance) for the slope. If low, it likely means that there is no slope variation of that random variable between classes and therefore the random slope estimation can be dropped from the next analyses. 
+
+The following test checks whether the model becomes significantly worse if a certain random effect is dropped (formally known as likelihood ratio tests), if this is not the case, the random effect is not significant.
+```{r}
+stats_random_M3 <- purrr::map_df(trait_names, function(t) {
+  res <- ranova(lmer_model3[[t]])
+  random_ls <- lapply(rownames(res)[-1], function(i){ # Exclude the first row name called "<none>"
+      pval <- res[i,]$`Pr(>Chisq)`
+      df <- tibble(Trait = t,
+                   p_val = pval)
+      df <- setNames(df, c("Trait", paste0(colnames(df)[2], "_", str_replace_all(i, "[[|,(),1, ,]]", ""))))
+    })
+  random_df <- Reduce(function(x, y) merge(x, y, by = "Trait"), random_ls)
+  }) 
+
+lapply(names(stats_random_M3)[-1], function(i) {
+  message(paste0("\tTraits with non-significant ", str_remove(i, "p_val_"), " effects: ", stats_random_M3 %>% filter(!!as.symbol(i)  > 0.05) %>% pull(Trait), "\n"))
+})
+```
+
+We can further validate the results with the following function.
+```{r}
+stats2_random_M3 <- lapply(trait_names, function(t) {
+  perc <- icc_specs(lmer_model3[[t]]) %>%
+    mutate_if(is.numeric, round, 2) %>% 
+    as.data.frame()
+}) 
+names(stats2_random_M3) <- trait_names
+stats2_random_M3
+```
+
+# Save session info 
+```{r}
+writeLines(capture.output(sessionInfo()), paste("sessionInfo",Sys.Date() ,".txt", sep=""))
+sessionInfo()
+```
