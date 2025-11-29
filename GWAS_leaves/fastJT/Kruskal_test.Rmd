@@ -1,0 +1,131 @@
+---
+title: "Kruskal wallis"
+author: "Sara Westman" 
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+&NewLine;
+</br>
+
+# Set-up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load packages
+```{r message = FALSE}
+library(tidyverse)
+library(ggpubr)
+library(dplyr)
+library(tibble)
+library(rstatix)
+```
+
+## Load data
+```{r}
+out_dir1 <- "/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/SNP_analyses/SPGs/tweedie/Kruskal_effsize"
+out_dir2 <- "/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/SNP_analyses/SPGs/tweedie/SNP_boxplots"
+
+# Genotype data
+snpmat <-"/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_ML/data/SNPs/SNPmat_for_fastJT/SwAsp_SNPmat_fastJT.rds"
+geno_feature <- readRDS(snpmat)
+
+# Sig SNPs
+in_dir <- "/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/SNP_analyses/SPGs/tweedie/Significant_SNPs"
+sig_files <- list.files(path = in_dir, pattern = "*.txt.gz", full.names = TRUE, recursive = FALSE)
+
+# Phenotype data 
+pheno <- read.delim("/mnt/picea/projects/aspseq/nstreet/swasp/Sara/GWAS_leaves/Metabolite_data/BLUPs/SPGs_tweedie/SPGs_tweedie_leaves_BLUP.txt")
+pheno$Genotype <- as.character(pheno$Genotype)
+```
+
+## Extract sig. SNPs
+```{r}
+snp_list <- lapply(sig_files, function(f) {
+  snps <- read.delim(f, header = TRUE) %>% pull(snp1)
+  })
+names(snp_list) <- gsub(pattern = ".txt.gz", replacement = "", basename(sig_files))
+```
+
+## Run Kruskal test
+```{r, results='hide'}
+lapply(names(snp_list), function(t) {
+  snps <- snp_list[[t]]
+  my_pheno <- pheno %>% dplyr::select(Genotype, (all_of(t)))
+  # loop snps 
+  krus <- lapply(snps, function(i) {
+    snp_df <- data.frame(snp = geno_feature[,i])
+    snp_df <- rownames_to_column(snp_df, var = "Genotype")
+    snp_df$Genotype <- stringr::str_remove(snp_df$Genotype, "^0+")
+    pheno_geno <- inner_join(my_pheno %>% mutate(Genotype = as.character(Genotype)),
+                             snp_df, by = "Genotype")
+    pheno_geno_compl <- pheno_geno[complete.cases(pheno_geno),]
+    
+    # kruskal test data 
+    termlabels <- y ~ snp
+    termlabels <- terms(termlabels)
+    res.kruskal <- pheno_geno_compl %>% kruskal_test(reformulate(attr(termlabels, "term.labels"), response = t))
+    res.kruskal.eff <- pheno_geno_compl %>% kruskal_effsize(reformulate(attr(termlabels, "term.labels"), response = t))
+    data.frame(trait = t,
+               snp = i,
+               pval = res.kruskal$p, 
+               effsize = res.kruskal.eff$effsize[[1]],
+               magnitude = res.kruskal.eff$magnitude,
+               method = res.kruskal.eff$method)
+  }) %>% bind_rows
+  write_tsv(krus, file = file.path(out_dir1, paste0(t, "_sig_SNPs_kruskal_BLUPs.tsv")), col_names = TRUE)
+})
+```
+
+## Make Kruskal boxplots 
+```{r}
+lapply(names(snp_list), function(t) {
+  snps <- snp_list[[t]]
+  my_pheno <- pheno %>% dplyr::select(Genotype, (all_of(t)))
+  pdf(file = file.path(out_dir2, paste0(t, "_SNP_boxplot.pdf")))
+  # loop snps 
+  lapply(snps, function(i) {
+    snp_df <- data.frame(snp = geno_feature[,i])
+    snp_df <- rownames_to_column(snp_df, var = "Genotype")
+    snp_df$Genotype <- stringr::str_remove(snp_df$Genotype, "^0+")
+    
+    pheno_geno <- inner_join(my_pheno %>% mutate(Genotype = as.character(Genotype)),
+                             snp_df, by = "Genotype")
+    pheno_geno_compl <- pheno_geno[complete.cases(pheno_geno),]
+    
+    # kruskal test info 
+    termlabels <- y ~ snp
+    termlabels <- terms(termlabels)
+    res.kruskal <- pheno_geno_compl %>% kruskal_test(reformulate(attr(termlabels, "term.labels"), response = t))
+    res.dunn <- pheno_geno_compl %>% dunn_test(reformulate(attr(termlabels, "term.labels"), response = t))
+    
+  # plot 
+    res.dunn <- res.dunn %>% add_xy_position(x = "snp")
+    cbPalette = c("#00AFBB", "#E7B800", "#FC4E07")
+    p <- ggboxplot(pheno_geno_compl, 
+                   x = "snp", 
+                   y = t, 
+                   fill = "snp", 
+                   palette = cbPalette) +
+      stat_pvalue_manual(res.dunn, hide.ns = TRUE) +
+      labs(title = i, 
+           subtitle = get_test_label(res.kruskal, detailed = TRUE),
+           caption = get_pwc_label(res.dunn),  
+           x = "Alleles", 
+           y = paste(t, "(BLUP)"))
+    print(p)
+  })
+  graphics.off()
+})
+```
+
+# Save session info 
+```{r}
+writeLines(capture.output(sessionInfo()), paste("sessionInfo",Sys.Date() ,".txt", sep=""))
+sessionInfo()
+```
